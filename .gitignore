@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ローカル設定(ツールのパス等、環境依存)
+settings.json
+
+# 一時ファイル
+.tsautosplit_thumbs/
+*.tmp
+*.conv188.tmp
+
+# PyInstallerビルド成果物・配布用パッケージ(Releaseに手動アップロードする、リポジトリには含めない)
+build/
+dist/
+release/
+*.spec
+
+# エディタ/OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# 出力例・テストで作られがちなもの
+*_split/
+split_summary_*.csv
