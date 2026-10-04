@@ -20,9 +20,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
 import time
-from dataclasses import dataclass, field, replace as dataclass_replace
+from dataclasses import asdict, dataclass, field, replace as dataclass_replace
 from typing import Callable, Optional
 
 from . import analyzer, mpegts, naming, overlap, probe, rplsinfo as rplsinfo_mod, thumbnail
@@ -52,6 +54,9 @@ class PipelineOptions:
     merge_detect_overlap: bool = True      # 結合時に重複バイナリデータを検出して除去する
     merge_pattern_mb: float = 1.0          # 重複検出に使う先頭パターンサイズ(MB)
     merge_search_window_mb: int = 256      # 重複検出で遡って探す範囲(MB)
+    tolerate_dropouts: bool = True         # 情報取得失敗(ドロップ等)のサンプルを境界とみなさない
+    merge_same_program: bool = True        # 前後が同じ番組なら間に化けた情報が挟まっても1つにまとめる
+    reuse_work_files: bool = True          # _workに前回の粗分割ファイルが残っていれば再利用する(詳細解析モード)
 
 
 @dataclass
@@ -213,13 +218,121 @@ def process_all(files: list[str], opts: PipelineOptions,
 
 
 # ------------------------------------------------------------- 詳細解析モード
+# ---- _workに残った粗分割ファイルの再利用 ----
+# 巨大ファイル(十数GB)ではPID走査+TsSplitterによる粗分割に非常に時間がかかるため、
+# 前回の処理で_workへ退避した粗分割ファイルが残っていれば、同じ入力・同じ分割設定の
+# 場合に限りそれを使い回す。取り違え防止のため、退避時にマニフェスト(入力ファイルの
+# パス/サイズ/更新日時、分割設定、各ファイルのサイズ)を_workに書き、再利用時に全て照合する。
+
+_MANIFEST_VERSION = 1
+
+
+def _split_fingerprint(opts: PipelineOptions) -> str:
+    d = asdict(opts.split_opts)
+    d["_preserve_all_pmt_pids"] = opts.preserve_all_pmt_pids
+    d["_convert_204"] = opts.convert_204
+    return json.dumps(d, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _src_signature(src: str) -> Optional[dict]:
+    try:
+        st = os.stat(src)
+    except OSError:
+        return None
+    return {"path": os.path.abspath(src).lower(), "size": st.st_size, "mtime": int(st.st_mtime)}
+
+
+def _manifest_path(out_dir: str, src: str) -> str:
+    key = hashlib.sha1(os.path.abspath(src).lower().encode("utf-8")).hexdigest()[:8]
+    stem = os.path.splitext(os.path.basename(src))[0]
+    return os.path.join(out_dir, "_work", f"{stem}.{key}.coarse.json")
+
+
+def _make_coarse_segment(src: str, out_dir: str, created_path: str) -> CoarseSegment:
+    ext = os.path.splitext(src)[1].lstrip(".")
+    orig_stem = os.path.splitext(os.path.basename(src))[0]
+    created_stem = os.path.splitext(os.path.basename(created_path))[0]
+    suffix = created_stem[len(orig_stem) + 1:] if created_stem.startswith(orig_stem + "_") else created_stem
+    seg_pr = probe.probe_file(created_path, sample_bytes=1024 * 1024)
+    return CoarseSegment(src=src, out_dir=out_dir, orig_stem=orig_stem, ext=ext,
+                          path=created_path, suffix=suffix, packet_size=seg_pr.packet_size or 188)
+
+
+def _try_reuse_work_segments(src: str, out_dir: str, opts: PipelineOptions,
+                              on_log: LogFn) -> Optional[list[CoarseSegment]]:
+    """_workに前回退避した粗分割ファイルがあり、入力・設定が一致していれば
+    out_dirへ戻して(同一ボリューム内のrenameなので瞬時)CoarseSegmentとして返す。
+    条件を満たさない場合はNone(通常どおりTsSplitterで分割する)。"""
+    mpath = _manifest_path(out_dir, src)
+    if not os.path.exists(mpath):
+        return None
+    try:
+        with open(mpath, "r", encoding="utf-8") as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        return None
+
+    if m.get("version") != _MANIFEST_VERSION or m.get("src") != _src_signature(src) \
+            or m.get("fingerprint") != _split_fingerprint(opts):
+        on_log("  _workに前回の粗分割ファイルがありますが、入力ファイルまたは分割設定が"
+               "異なる(変更された)ため再利用せず、あらためて分割します。")
+        return None
+
+    work_dir = os.path.dirname(mpath)
+    plan = []
+    for e in m.get("segments", []):
+        wp = os.path.join(work_dir, e["work_name"])
+        dp = os.path.join(out_dir, e["orig_name"])
+        try:
+            if not os.path.isfile(wp) or os.path.getsize(wp) != e["size"] or os.path.exists(dp):
+                on_log("  _workの粗分割ファイルが欠けている/変更されている、または出力先に同名ファイルが"
+                       "あるため再利用せず、あらためて分割します。")
+                return None
+        except OSError:
+            return None
+        plan.append((wp, dp))
+    if not plan:
+        return None
+
+    moved: list[tuple[str, str]] = []
+    try:
+        for wp, dp in plan:
+            os.replace(wp, dp)
+            moved.append((wp, dp))
+    except OSError as e:
+        for wp, dp in moved:
+            try:
+                os.replace(dp, wp)
+            except OSError:
+                pass
+        on_log(f"  _workからの復元に失敗したため再利用せず、あらためて分割します: {e}")
+        return None
+    try:
+        os.remove(mpath)   # ファイルを出力先へ戻したので、マニフェストは次回退避時に作り直す
+    except OSError:
+        pass
+
+    on_log(f"  _workに残っていた前回の粗分割ファイル{len(moved)}個を再利用します"
+           f"(PID走査・TsSplitterによる分割をスキップ)。")
+    return [_make_coarse_segment(src, out_dir, dp) for _, dp in moved]
+
+
 def split_coarse(src: str, opts: PipelineOptions,
-                  on_log: LogFn, on_progress: ProgressFn) -> tuple[list[CoarseSegment], list[str]]:
-    """TsSplitterでチャンネル/PMT単位に粗く分割する(詳細解析モードの第1段階)。"""
+                  on_log: LogFn, on_progress: ProgressFn,
+                  allow_reuse: bool = False) -> tuple[list[CoarseSegment], list[str]]:
+    """TsSplitterでチャンネル/PMT単位に粗く分割する(詳細解析モードの第1段階)。
+
+    allow_reuse=Trueかつopts.reuse_work_filesなら、_workに前回の粗分割ファイルが
+    残っていて入力・設定が一致する場合にそれを再利用し、PID走査と分割を省略する。"""
     errors: list[str] = []
     on_log(f"=== 入力: {src} ===")
     pr = probe.probe_file(src)
     on_log(f"  形式判定: {pr.detail}")
+
+    if allow_reuse and opts.reuse_work_files and opts.intermediate_handling == "subfolder":
+        reused = _try_reuse_work_segments(src, _resolve_out_dir(src, opts), opts, on_log)
+        if reused:
+            return reused, errors
 
     work_src = src
     tmp_converted = None
@@ -240,14 +353,23 @@ def split_coarse(src: str, opts: PipelineOptions,
 
     # TsSplitterは映像/音声/PCR/EIT等の既知の種別以外のPMT記載PID
     # (データ放送のデータカルーセル等, stream_type 0x0D)を既定では保持しない。
-    # ファイルを複数地点でサンプリングして実際に使われている全PIDを洗い出し、
-    # -PIDで明示的に保持させることで、dデータ放送等も含め元データにできるだけ
-    # 近い形で残す。
+    # ファイル全体を1回走査して実際に使われている全PIDを洗い出し、-PIDで
+    # 明示的に保持させることで、データ放送等も含め元データにできるだけ近い形で
+    # 残す(以前は等間隔サンプリングだったため、サンプル間隔より短い区間にしか
+    # 存在しない番組のPMTを見落とし、そのPIDが丸ごと欠落したファイルが生成される
+    # 不具合があった。実データで、PATはプログラムを指しているのに対応するPMTの
+    # パケットが1つも無いために一部のプレーヤー(TVTest等)で再生できないファイルが
+    # 生成されるケースを確認し、全パケット走査方式に変更した)。
     effective_split_opts = opts.split_opts
     if opts.preserve_all_pmt_pids:
         sync_offset = 4 if pr.packet_size == 192 else 0
+
+        def pid_scan_progress(cur, total, _src=src):
+            on_progress(f"{os.path.basename(_src)} (PID構成を走査中)", cur, total, int(cur * 100 / total) if total else 0)
+
         try:
-            found_pids = mpegts.scan_all_pmt_pids(work_src, pr.packet_size or 188, sync_offset)
+            found_pids = mpegts.scan_all_pmt_pids(work_src, pr.packet_size or 188, sync_offset,
+                                                   on_progress=pid_scan_progress)
         except OSError:
             found_pids = set()
         if found_pids:
@@ -312,6 +434,7 @@ def analyze_coarse_segments(segments: list[CoarseSegment], opts: PipelineOptions
         on_log(f"  解析中: {os.path.basename(seg.path)}")
         seg.candidates = analyzer.analyze_segment(
             opts.rplsinfo_exe, seg.path, num_points=opts.analysis_points, on_log=on_log,
+            tolerate_dropouts=opts.tolerate_dropouts, merge_same_program=opts.merge_same_program,
         )
         on_log(f"    -> 候補 {len(seg.candidates)} 件")
 
@@ -431,6 +554,10 @@ def _cleanup_coarse_segments(segments: list[CoarseSegment], opts: PipelineOption
 
     # (out_dir, orig_stem) ごとに1回だけ .log/_tsselect.log をまとめて処理する
     handled_stems: set = set()
+    moved_by_src: dict = {}
+    total_by_src: dict = {}
+    for seg in segments:
+        total_by_src[(seg.out_dir, seg.src)] = total_by_src.get((seg.out_dir, seg.src), 0) + 1
 
     for seg in segments:
         paths_to_handle = []
@@ -474,6 +601,29 @@ def _cleanup_coarse_segments(segments: list[CoarseSegment], opts: PipelineOption
                 os.replace(p, dst)
             except OSError as e:
                 on_log(f"  警告: 中間ファイル移動失敗: {p} ({e})")
+                continue
+            if p == seg.path:
+                moved_by_src.setdefault((seg.out_dir, seg.src), []).append({
+                    "orig_name": os.path.basename(p),
+                    "work_name": os.path.basename(dst),
+                    "size": os.path.getsize(dst),
+                })
+
+    # 次回の再利用用にマニフェストを書く(その入力ファイルの粗分割ファイルが全て
+    # 退避できた場合のみ。簡易モード等で一部が最終ファイルになって欠けた場合は書かない)。
+    for (out_dir, src), entries in moved_by_src.items():
+        if len(entries) != total_by_src.get((out_dir, src), -1):
+            continue
+        sig = _src_signature(src)
+        if sig is None:
+            continue
+        try:
+            with open(_manifest_path(out_dir, src), "w", encoding="utf-8") as f:
+                json.dump({"version": _MANIFEST_VERSION, "src": sig,
+                           "fingerprint": _split_fingerprint(opts), "segments": entries},
+                          f, ensure_ascii=False, indent=1)
+        except OSError as e:
+            on_log(f"  警告: 再利用用マニフェストを書けませんでした: {e}")
 
 
 def _cleanup_thumbnails(segments: list[CoarseSegment]) -> None:

@@ -25,7 +25,10 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ts_tools import config, naming, pipeline, thumbnail
+from ts_tools.packet_viewer_ui import PacketViewerPanel
 from ts_tools.pipeline import CoarseSegment, PipelineOptions, process_all
+from ts_tools.pmt_repair_ui import PmtRepairPanel
+from ts_tools.repair_ui import RepairPanel
 from ts_tools.review_ui import ReviewWindow
 from ts_tools.splitter import SPLIT_MODES, SplitOptions
 
@@ -68,6 +71,15 @@ class App(_BaseTk):
 
         self._build_main_tab(main_tab)
         self._build_option_tab(opt_tab)
+
+        repair_tab = RepairPanel(nb)
+        nb.add(repair_tab, text="複数ソース補完(実験的)")
+
+        pmt_repair_tab = PmtRepairPanel(nb)
+        nb.add(pmt_repair_tab, text="再生修復・整理(実験的)")
+
+        viewer_tab = PacketViewerPanel(nb)
+        nb.add(viewer_tab, text="パケットビューア(実験的)")
 
     def _build_main_tab(self, parent):
         drop_hint = "(ここにファイル/フォルダをドラッグ&ドロップできます)" if DND_AVAILABLE else \
@@ -224,6 +236,18 @@ class App(_BaseTk):
         self.snap_keyframe_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_analysis, text="解析で検出した区切りをキーフレーム(GOP先頭)に位置合わせする(推奨)",
                          variable=self.snap_keyframe_var).pack(anchor="w")
+
+        self.tolerate_dropouts_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm_analysis, text="ドロップ等で番組情報を取得できない箇所を、番組の境目とみなさない(推奨)",
+                         variable=self.tolerate_dropouts_var).pack(anchor="w")
+        self.merge_same_program_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm_analysis, text="前後が同じ番組(日付・開始時刻・タイトル一致)なら、間に化けた情報が"
+                                            "挟まっていても1つの番組にまとめる(推奨)",
+                         variable=self.merge_same_program_var).pack(anchor="w")
+        self.reuse_work_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm_analysis, text="_workフォルダに前回の粗分割ファイルが残っていれば再利用する"
+                                            "(入力・分割設定が同じ場合のみ)",
+                         variable=self.reuse_work_var).pack(anchor="w")
 
         # rplsinfo設定
         frm_info = ttk.LabelFrame(parent, text="番組情報の取得 (rplsinfo)")
@@ -403,6 +427,9 @@ class App(_BaseTk):
             snap_to_keyframe=self.snap_keyframe_var.get(),
             preserve_all_pmt_pids=self.preserve_all_pids.get(),
             intermediate_handling=self.intermediate_var.get(),
+            tolerate_dropouts=self.tolerate_dropouts_var.get(),
+            merge_same_program=self.merge_same_program_var.get(),
+            reuse_work_files=self.reuse_work_var.get(),
         )
 
     def _start(self):
@@ -457,7 +484,7 @@ class App(_BaseTk):
                     if should_cancel():
                         on_log("キャンセルされました。")
                         break
-                    segs, errs = pipeline.split_coarse(src, opts, on_log, on_progress)
+                    segs, errs = pipeline.split_coarse(src, opts, on_log, on_progress, allow_reuse=True)
                     for e in errs:
                         on_log("  ! " + e)
                     if segs:

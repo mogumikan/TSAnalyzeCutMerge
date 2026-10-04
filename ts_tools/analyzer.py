@@ -8,6 +8,16 @@
 タイトルが変化する区間を見つけ、隣接サンプル間で二分探索して境界を絞り込む。
 実測(2026-09-04)で 267MBのファイルに対し25点サンプリング+絞り込みが1秒未満で
 完了することを確認済み。
+
+ドロップ(テープのドロップアウト・パケット欠損)への方針:
+  番組の頭から終わりまでの間にドロップがあっても、同じ番組(日付・開始時刻・
+  タイトルが一致)として1つの候補にまとめる。そのため
+    * 番組情報を取得できなかったサンプル(ドロップ地点に当たった等)は「不明」として
+      境界判定に使わず、取得できたサンプルだけで番組の切り替わりを判定する
+    * 二分探索中に取得できない地点は近傍の位置で取り直す
+    * 番組情報が化けて取れた(前後と食い違う)サンプルが1つ挟まっていても、その前後が
+      同じ番組ならまとめて同一番組とみなす
+    * ファイルの先頭/末尾側で取得できなかった区間は、隣接する番組に含める
 """
 from __future__ import annotations
 
@@ -55,8 +65,16 @@ def _sample(rplsinfo_exe: str, path: str, pct: int, limit_mb: int) -> Optional[d
 
 def analyze_segment(rplsinfo_exe: str, path: str, num_points: int = 25,
                      limit_mb: int = 20, min_gap_pct: int = 1,
-                     on_log: Optional[Callable[[str], None]] = None) -> list[ProgramCandidate]:
-    """pathの中身を粗くサンプリングし、番組候補の区間リスト(pct単位)を返す。"""
+                     on_log: Optional[Callable[[str], None]] = None,
+                     tolerate_dropouts: bool = True,
+                     merge_same_program: bool = True) -> list[ProgramCandidate]:
+    """pathの中身を粗くサンプリングし、番組候補の区間リスト(pct単位)を返す。
+
+    tolerate_dropouts: 番組情報を取得できなかったサンプルを「不明」として境界判定に使わず、
+        二分探索で近傍を取り直し、先頭/末尾の取得できない区間を隣の番組に含める。
+        Falseなら取得失敗も1つの状態として扱う従来動作(失敗地点が境界になりうる)。
+    merge_same_program: 前後が同じ番組(日付・開始時刻・タイトル一致)なら、間に化けた
+        情報等が挟まっていても1つの番組にまとめる。"""
     on_log = on_log or (lambda s: None)
     size = os.path.getsize(path)
     if size <= 0:
@@ -73,22 +91,44 @@ def analyze_segment(rplsinfo_exe: str, path: str, num_points: int = 25,
             cache[pct] = _sample(rplsinfo_exe, path, pct, limit_mb)
         return cache[pct]
 
+    def get_near(pct: int, lo: int, hi: int) -> Optional[dict]:
+        """pctで取得できなければ、(lo,hi)の範囲内で近傍(±1,±2)を取り直す
+        (ドロップ地点に当たっただけの取得失敗を、境界と誤認しないため)。"""
+        if not tolerate_dropouts:
+            return get(pct)
+        for off in (0, 1, -1, 2, -2):
+            p = pct + off
+            if off != 0 and not (lo < p < hi):
+                continue
+            data = get(p)
+            if data:
+                return data
+        return None
+
     for p in pcts:
         get(p)
     on_log(f"    粗サンプリング {len(pcts)}点完了")
 
-    # 隣接サンプル間で信号(タイトル等)が変わる場所を二分探索で絞り込む
+    # 取得できたサンプルだけで番組の切り替わりを判定する(取得できなかった=不明は
+    # ドロップ等の可能性があるため境界とはみなさない)
+    if tolerate_dropouts:
+        known = [(p, _signature(cache[p])) for p in pcts if cache[p]]
+    else:
+        known = [(p, _signature(cache[p])) for p in pcts]
+    n_unknown = sum(1 for p in pcts if not cache[p])
+    if n_unknown and tolerate_dropouts:
+        on_log(f"    番組情報を取得できなかったサンプル {n_unknown}点(ドロップ等の可能性。境界とはみなしません)")
+
     boundaries: list[int] = [0]
-    for a, b in zip(pcts, pcts[1:]):
-        sig_a = _signature(get(a))
-        sig_b = _signature(get(b))
+    for (a, sig_a), (b, sig_b) in zip(known, known[1:]):
         if sig_a == sig_b:
             continue
         lo, hi = a, b
         while hi - lo > min_gap_pct:
             mid = (lo + hi) // 2
-            sig_mid = _signature(get(mid))
-            if sig_mid == sig_a:
+            sig_mid = _signature(get_near(mid, lo, hi))
+            if sig_mid == sig_a or (tolerate_dropouts and sig_mid is None):
+                # 近傍でも取得できない地点は、前の番組側に含める(境界は取得できた側へ寄せる)
                 lo = mid
             else:
                 hi = mid
@@ -98,20 +138,36 @@ def analyze_segment(rplsinfo_exe: str, path: str, num_points: int = 25,
     boundaries = sorted(set(boundaries))
     on_log(f"    境界候補: {boundaries}")
 
+    def info_for(start_pct: int, end_pct: int) -> dict:
+        """候補区間内で最初に取得できたサンプルの番組情報(先頭がドロップでも取れるように)。"""
+        if not tolerate_dropouts:
+            return get(min(99, start_pct)) or {}
+        for p in sorted(k for k in cache if start_pct <= k < end_pct):
+            if cache[p]:
+                return cache[p] or {}
+        for p in sorted((k for k in cache if k < start_pct), reverse=True):
+            if cache[p]:
+                return cache[p] or {}
+        return {}
+
     candidates: list[ProgramCandidate] = []
     for start_pct, end_pct in zip(boundaries, boundaries[1:]):
-        probe_pct = min(99, start_pct)
-        data = get(probe_pct) or {}
         start_byte = int(size * start_pct / 100)
         end_byte = int(size * end_pct / 100) if end_pct < 100 else size
         if end_byte <= start_byte:
             continue
         candidates.append(ProgramCandidate(
             start_pct=start_pct, end_pct=end_pct,
-            start_byte=start_byte, end_byte=end_byte, info=data,
+            start_byte=start_byte, end_byte=end_byte, info=info_for(start_pct, end_pct),
         ))
 
-    # 隣接する候補の信号が同じなら統合する(サンプリングの取りこぼし対策)
+    merged = _merge_same_program(candidates, on_log) if merge_same_program else _merge_adjacent_same(candidates)
+    merged = _merge_dropout_gaps(merged, on_log)
+    return merged
+
+
+def _merge_adjacent_same(candidates: list[ProgramCandidate]) -> list[ProgramCandidate]:
+    """隣り合う候補の番組情報が同じなら統合する(従来動作)。"""
     merged: list[ProgramCandidate] = []
     for c in candidates:
         if merged and merged[-1].signature() == c.signature():
@@ -119,9 +175,40 @@ def analyze_segment(rplsinfo_exe: str, path: str, num_points: int = 25,
             merged[-1].end_byte = c.end_byte
         else:
             merged.append(c)
-
-    merged = _merge_dropout_gaps(merged, on_log)
     return merged
+
+
+def _merge_same_program(candidates: list[ProgramCandidate],
+                         on_log: Callable[[str], None]) -> list[ProgramCandidate]:
+    """日付・開始時刻・タイトルが同じ候補は同一番組として統合する。
+    間に別の情報が挟まっていても(ドロップで番組情報が化けて取れた場合など)、
+    その前後が同じ番組なら、間も含めて1つの番組にまとめる
+    (同じ日付・開始時刻の番組が別番組を挟んで再登場することは無いため)。"""
+    out: list[ProgramCandidate] = []
+    i = 0
+    while i < len(candidates):
+        c = candidates[i]
+        sig = c.signature()
+        if sig != (None, None, None) and c.info:
+            last = None
+            for j in range(len(candidates) - 1, i, -1):
+                if candidates[j].info and candidates[j].signature() == sig:
+                    last = j
+                    break
+            if last is not None:
+                span = candidates[i:last + 1]
+                if len(span) > 1:
+                    on_log(f"    同一番組の途中にドロップ等と思われる区間があるため、"
+                           f"{c.start_pct}-{candidates[last].end_pct}%を1つの番組として統合しました"
+                           f"(候補{len(span)}件→1件)")
+                c.end_pct = candidates[last].end_pct
+                c.end_byte = candidates[last].end_byte
+                i = last + 1
+                out.append(c)
+                continue
+        out.append(c)
+        i += 1
+    return out
 
 
 def _merge_dropout_gaps(candidates: list[ProgramCandidate],
